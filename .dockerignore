@@ -1,0 +1,28 @@
+# Git
+.git
+.gitignore
+
+# Build artifacts
+podmeter
+main
+*.exe
+*.out
+
+# Documentation
+README.md
+LICENSE
+
+# Kubernetes manifests
+*.yaml
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Test files
+*_test.go

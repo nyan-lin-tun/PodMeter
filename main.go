@@ -1,14 +1,20 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"log"
 	"math"
 	"net/http"
+	"os"
+	"os/exec"
 	"runtime"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -44,6 +50,18 @@ type Stats struct {
 	ProxyDetected    bool    `json:"proxy_detected"`
 	IstioSidecar     bool    `json:"istio_sidecar_detected"`
 	RequestsViaProxy int64   `json:"requests_via_proxy"`
+
+	// System information
+	Hostname         string  `json:"hostname"`
+	OS               string  `json:"os"`
+	Architecture     string  `json:"architecture"`
+	NumCPU           int     `json:"num_cpu"`
+	KernelVersion    string  `json:"kernel_version"`
+	TotalMemoryMB    float64 `json:"total_memory_mb"`
+	AvailableMemoryMB float64 `json:"available_memory_mb"`
+	TotalDiskGB      float64 `json:"total_disk_gb"`
+	AvailableDiskGB  float64 `json:"available_disk_gb"`
+	DiskUsagePercent float64 `json:"disk_usage_percent"`
 }
 
 var (
@@ -164,6 +182,12 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 		avgHops = round(float64(totalHops) / float64(len(proxyHopsCopy)))
 	}
 
+	// Get system information
+	hostname, kernelVersion := getSystemInfo()
+	totalMemMB := getTotalMemoryMB()
+	availMemMB := getAvailableMemoryMB()
+	totalDiskGB, availDiskGB, diskUsagePercent := getDiskStats()
+
 	if len(latenciesCopy) == 0 {
 		stats := Stats{
 			Requests:          totalRequests,
@@ -181,6 +205,16 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 			ProxyDetected:     proxyDetected,
 			IstioSidecar:      istioDetected,
 			RequestsViaProxy:  totalViaProxy,
+			Hostname:          hostname,
+			OS:                runtime.GOOS,
+			Architecture:      runtime.GOARCH,
+			NumCPU:            runtime.NumCPU(),
+			KernelVersion:     kernelVersion,
+			TotalMemoryMB:     totalMemMB,
+			AvailableMemoryMB: availMemMB,
+			TotalDiskGB:       totalDiskGB,
+			AvailableDiskGB:   availDiskGB,
+			DiskUsagePercent:  diskUsagePercent,
 		}
 		if totalRequests > 0 {
 			stats.SuccessRate = round(float64(totalRequests-totalErrors) / float64(totalRequests) * 100)
@@ -248,6 +282,18 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 		ProxyDetected:    proxyDetected,
 		IstioSidecar:     istioDetected,
 		RequestsViaProxy: totalViaProxy,
+
+		// System information
+		Hostname:          hostname,
+		OS:                runtime.GOOS,
+		Architecture:      runtime.GOARCH,
+		NumCPU:            runtime.NumCPU(),
+		KernelVersion:     kernelVersion,
+		TotalMemoryMB:     totalMemMB,
+		AvailableMemoryMB: availMemMB,
+		TotalDiskGB:       totalDiskGB,
+		AvailableDiskGB:   availDiskGB,
+		DiskUsagePercent:  diskUsagePercent,
 	}
 
 	json.NewEncoder(w).Encode(stats)
@@ -263,6 +309,98 @@ func percentile(data []float64, p float64) float64 {
 
 func round(val float64) float64 {
 	return math.Round(val*100) / 100
+}
+
+// getSystemInfo collects system information
+func getSystemInfo() (hostname, kernelVersion string) {
+	// Get hostname
+	hostname, _ = os.Hostname()
+	if hostname == "" {
+		hostname = "unknown"
+	}
+
+	// Get kernel version from uname -a
+	if cmd := exec.Command("uname", "-a"); cmd != nil {
+		if output, err := cmd.Output(); err == nil {
+			kernelVersion = strings.TrimSpace(string(output))
+		}
+	}
+
+	if kernelVersion == "" {
+		kernelVersion = "unknown"
+	}
+
+	return
+}
+
+// getTotalMemoryMB reads total system memory from /proc/meminfo (Linux)
+func getTotalMemoryMB() float64 {
+	file, err := os.Open("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "MemTotal:") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				kb, err := strconv.ParseFloat(fields[1], 64)
+				if err == nil {
+					return round(kb / 1024) // Convert KB to MB
+				}
+			}
+		}
+	}
+	return 0
+}
+
+// getAvailableMemoryMB reads available system memory from /proc/meminfo (Linux)
+func getAvailableMemoryMB() float64 {
+	file, err := os.Open("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "MemAvailable:") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				kb, err := strconv.ParseFloat(fields[1], 64)
+				if err == nil {
+					return round(kb / 1024) // Convert KB to MB
+				}
+			}
+		}
+	}
+	return 0
+}
+
+// getDiskStats gets filesystem statistics for the root partition
+func getDiskStats() (totalGB, availableGB, usagePercent float64) {
+	var stat syscall.Statfs_t
+	err := syscall.Statfs("/", &stat)
+	if err != nil {
+		return 0, 0, 0
+	}
+
+	// Calculate total and available space
+	totalBytes := stat.Blocks * uint64(stat.Bsize)
+	availBytes := stat.Bavail * uint64(stat.Bsize)
+
+	totalGB = round(float64(totalBytes) / 1024 / 1024 / 1024)
+	availableGB = round(float64(availBytes) / 1024 / 1024 / 1024)
+
+	if totalGB > 0 {
+		usagePercent = round((float64(totalBytes-availBytes) / float64(totalBytes)) * 100)
+	}
+
+	return
 }
 
 func main() {
