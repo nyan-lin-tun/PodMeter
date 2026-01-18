@@ -6,6 +6,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+    "net"
 	"os"
 	"os/exec"
 	"runtime"
@@ -72,6 +73,11 @@ var (
 	errors           atomic.Int64
 	requestsViaProxy atomic.Int64
 	startTime        time.Time
+
+    // Cached detection of Istio sidecar presence in the pod's network namespace
+    istioDetectMu      sync.RWMutex
+    istioPresentCached bool
+    istioLastChecked   time.Time
 )
 
 func handler(w http.ResponseWriter, r *http.Request) {
@@ -170,7 +176,12 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 	// Detect proxy from current request headers
 	currentHops := countProxyHops(r)
 	proxyDetected := currentHops > 0
-	istioDetected := r.Header.Get("X-B3-TraceId") != "" || r.Header.Get("X-Envoy-Decorator-Operation") != ""
+
+	// Detect Istio sidecar presence. We combine two signals:
+	// 1) Request headers that Envoy/Istio often injects when traffic traverses the proxy
+	// 2) A pod-level probe of Envoy admin port on 127.0.0.1:15000 which indicates sidecar is present
+	istioHeaderSignal := hasIstioHeaders(r)
+	istioDetected := istioHeaderSignal || istioSidecarPresent()
 
 	// Calculate average proxy hops
 	avgHops := 0.0
@@ -309,6 +320,58 @@ func percentile(data []float64, p float64) float64 {
 
 func round(val float64) float64 {
 	return math.Round(val*100) / 100
+}
+
+// hasIstioHeaders checks common Istio/Envoy headers on the incoming request.
+// Note: These only appear if the request actually traversed the proxy.
+func hasIstioHeaders(r *http.Request) bool {
+    h := r.Header
+    if h.Get("X-B3-TraceId") != "" { // B3 tracing header used by Istio when tracing is enabled
+        return true
+    }
+    if h.Get("X-Envoy-Decorator-Operation") != "" { // Envoy route/operation decoration
+        return true
+    }
+    if h.Get("X-Request-Id") != "" { // Frequently added by Envoy
+        return true
+    }
+    if h.Get("X-Envoy-Attempt-Count") != "" || h.Get("X-Envoy-Internal") != "" {
+        return true
+    }
+    return false
+}
+
+// istioSidecarPresent detects whether an Envoy sidecar is present in the pod.
+// It probes Envoy's admin port (127.0.0.1:15000). Result is cached and refreshed
+// at most every 30 seconds to avoid per-request overhead.
+func istioSidecarPresent() bool {
+    istioDetectMu.RLock()
+    recent := time.Since(istioLastChecked) < 30*time.Second
+    cached := istioPresentCached
+    istioDetectMu.RUnlock()
+
+    if recent {
+        return cached
+    }
+
+    present := probeEnvoyAdmin()
+
+    istioDetectMu.Lock()
+    istioPresentCached = present
+    istioLastChecked = time.Now()
+    istioDetectMu.Unlock()
+    return present
+}
+
+// probeEnvoyAdmin attempts a quick TCP connect to Envoy's admin port.
+// If the connection succeeds, we assume the Istio sidecar is running.
+func probeEnvoyAdmin() bool {
+    conn, err := net.DialTimeout("tcp", "127.0.0.1:15000", 50*time.Millisecond)
+    if err == nil {
+        _ = conn.Close()
+        return true
+    }
+    return false
 }
 
 // getSystemInfo collects system information
