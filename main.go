@@ -47,11 +47,12 @@ type Stats struct {
 	UptimeSeconds int64 `json:"uptime_seconds"`
 
 	// Network/Proxy metrics
-	CurrentHopCount  int     `json:"current_hop_count"`
-	AvgProxyHops     float64 `json:"avg_proxy_hops"`
-	ProxyDetected    bool    `json:"proxy_detected"`
-	IstioSidecar     bool    `json:"istio_sidecar_detected"`
-	RequestsViaProxy int64   `json:"requests_via_proxy"`
+	CurrentHopCount  int                `json:"current_hop_count"`
+	AvgProxyHops     float64            `json:"avg_proxy_hops"`
+	ProxyDetected    bool               `json:"proxy_detected"`
+	IstioSidecar     bool               `json:"istio_sidecar_detected"`
+	RequestsViaProxy int64              `json:"requests_via_proxy"`
+	DebugHeaders     map[string]string  `json:"debug_headers,omitempty"`
 
 	// System information
 	Hostname         string  `json:"hostname"`
@@ -178,6 +179,16 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 	currentHops := countProxyHops(r)
 	proxyDetected := currentHops > 0
 
+	// Collect debug headers to understand hop counting
+	debugHeaders := make(map[string]string)
+	headersToCheck := []string{"X-Forwarded-For", "Via", "X-Envoy-External-Address",
+		"X-Envoy-Decorator-Operation", "X-B3-TraceId", "X-Request-Id", "X-Real-IP"}
+	for _, hdr := range headersToCheck {
+		if val := r.Header.Get(hdr); val != "" {
+			debugHeaders[hdr] = val
+		}
+	}
+
 	// Detect Istio sidecar presence. We combine two signals:
 	// 1) Request headers that Envoy/Istio often injects when traffic traverses the proxy
 	// 2) A pod-level probe of Envoy admin port on 127.0.0.1:15000 which indicates sidecar is present
@@ -218,6 +229,7 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 			ProxyDetected:     proxyDetected,
 			IstioSidecar:      istioDetected,
 			RequestsViaProxy:  totalViaProxy,
+			DebugHeaders:      debugHeaders,
 			Hostname:          hostname,
 			OS:                runtime.GOOS,
 			Architecture:      runtime.GOARCH,
@@ -296,6 +308,7 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 		ProxyDetected:    proxyDetected,
 		IstioSidecar:     istioDetected,
 		RequestsViaProxy: totalViaProxy,
+		DebugHeaders:     debugHeaders,
 
 		// System information
 		Hostname:          hostname,
