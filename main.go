@@ -469,6 +469,25 @@ func getDiskStats() (totalGB, availableGB, usagePercent float64) {
 	return
 }
 
+func debugHeadersHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	headers := make(map[string][]string)
+	for name, values := range r.Header {
+		headers[name] = values
+	}
+
+	hopCount := countProxyHops(r)
+
+	response := map[string]interface{}{
+		"headers": headers,
+		"hop_count": hopCount,
+		"remote_addr": r.RemoteAddr,
+	}
+
+	json.NewEncoder(w).Encode(response)
+}
+
 func main() {
 	// Initialize start time for uptime tracking
 	startTime = time.Now()
@@ -479,6 +498,7 @@ func main() {
 
 	http.HandleFunc("/", handler)
 	http.HandleFunc("/stats", statsHandler)
+	http.HandleFunc("/debug/headers", debugHeadersHandler)
 
 	log.Println("App running on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
