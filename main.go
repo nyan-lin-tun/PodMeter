@@ -47,12 +47,15 @@ type Stats struct {
 	UptimeSeconds int64 `json:"uptime_seconds"`
 
 	// Network/Proxy metrics
-	CurrentHopCount  int                `json:"current_hop_count"`
-	AvgProxyHops     float64            `json:"avg_proxy_hops"`
-	ProxyDetected    bool               `json:"proxy_detected"`
-	IstioSidecar     bool               `json:"istio_sidecar_detected"`
-	RequestsViaProxy int64              `json:"requests_via_proxy"`
-	DebugHeaders     map[string]string  `json:"debug_headers,omitempty"`
+	CurrentHopCount    int                `json:"current_hop_count"`     // Deprecated: use proxy_hop_count + service_mesh_hops
+	ProxyHopCount      int                `json:"proxy_hop_count"`       // Traditional proxy hops (nginx, X-Forwarded-For, Via)
+	ServiceMeshHops    int                `json:"service_mesh_hops"`     // Service mesh hops (Istio/Envoy headers)
+	TotalHopCount      int                `json:"total_hop_count"`       // proxy_hop_count + service_mesh_hops
+	AvgProxyHops       float64            `json:"avg_proxy_hops"`
+	ProxyDetected      bool               `json:"proxy_detected"`
+	IstioSidecar       bool               `json:"istio_sidecar_detected"`
+	RequestsViaProxy   int64              `json:"requests_via_proxy"`
+	DebugHeaders       map[string]string  `json:"debug_headers,omitempty"`
 
 	// System information
 	Hostname         string  `json:"hostname"`
@@ -85,8 +88,8 @@ var (
 func handler(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
-	// Detect proxy hops from headers
-	hops := countProxyHops(r)
+	// Detect total proxy + service mesh hops from headers
+	hops := countTotalHops(r)
 
 	// Simulate some work
 	time.Sleep(20 * time.Millisecond)
@@ -111,6 +114,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("OK\n"))
 }
 
+// countProxyHops counts traditional proxy hops (nginx, load balancers, etc.)
 func countProxyHops(r *http.Request) int {
 	hops := 0
 
@@ -137,6 +141,18 @@ func countProxyHops(r *http.Request) int {
 		hops += count
 	}
 
+	return hops
+}
+
+// countServiceMeshHops counts service mesh hops (Istio/Envoy/ztunnel)
+func countServiceMeshHops(r *http.Request) int {
+	hops := 0
+
+	// X-Request-Id is added by Envoy (both sidecar and ambient mode)
+	if r.Header.Get("X-Request-Id") != "" {
+		hops++
+	}
+
 	// Check Envoy-specific headers (Istio uses Envoy)
 	if r.Header.Get("X-Envoy-External-Address") != "" {
 		hops++
@@ -147,11 +163,19 @@ func countProxyHops(r *http.Request) int {
 
 	// Check for Istio-specific headers
 	if r.Header.Get("X-B3-TraceId") != "" {
-		// Istio uses B3 propagation
+		// Istio uses B3 propagation for distributed tracing
+		hops++
+	}
+	if r.Header.Get("X-B3-SpanId") != "" {
 		hops++
 	}
 
 	return hops
+}
+
+// countTotalHops returns total proxy + service mesh hops (deprecated, use split counters)
+func countTotalHops(r *http.Request) int {
+	return countProxyHops(r) + countServiceMeshHops(r)
 }
 
 func statsHandler(w http.ResponseWriter, r *http.Request) {
@@ -175,14 +199,17 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
 
-	// Detect proxy from current request headers
-	currentHops := countProxyHops(r)
-	proxyDetected := currentHops > 0
+	// Detect proxy and service mesh hops from current request headers
+	proxyHops := countProxyHops(r)
+	meshHops := countServiceMeshHops(r)
+	totalHops := proxyHops + meshHops
+	currentHops := totalHops // For backwards compatibility
+	proxyDetected := totalHops > 0
 
 	// Collect debug headers to understand hop counting
 	debugHeaders := make(map[string]string)
 	headersToCheck := []string{"X-Forwarded-For", "Via", "X-Envoy-External-Address",
-		"X-Envoy-Decorator-Operation", "X-B3-TraceId", "X-Request-Id", "X-Real-IP"}
+		"X-Envoy-Decorator-Operation", "X-B3-TraceId", "X-B3-SpanId", "X-Request-Id", "X-Real-IP"}
 	for _, hdr := range headersToCheck {
 		if val := r.Header.Get(hdr); val != "" {
 			debugHeaders[hdr] = val
@@ -225,6 +252,9 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 			NumGC:             memStats.NumGC,
 			UptimeSeconds:     int64(uptime),
 			CurrentHopCount:   currentHops,
+			ProxyHopCount:     proxyHops,
+			ServiceMeshHops:   meshHops,
+			TotalHopCount:     totalHops,
 			AvgProxyHops:      avgHops,
 			ProxyDetected:     proxyDetected,
 			IstioSidecar:      istioDetected,
@@ -304,6 +334,9 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 
 		// Network/Proxy metrics
 		CurrentHopCount:  currentHops,
+		ProxyHopCount:    proxyHops,
+		ServiceMeshHops:  meshHops,
+		TotalHopCount:    totalHops,
 		AvgProxyHops:     avgHops,
 		ProxyDetected:    proxyDetected,
 		IstioSidecar:     istioDetected,
@@ -490,12 +523,17 @@ func debugHeadersHandler(w http.ResponseWriter, r *http.Request) {
 		headers[name] = values
 	}
 
-	hopCount := countProxyHops(r)
+	proxyHops := countProxyHops(r)
+	meshHops := countServiceMeshHops(r)
+	totalHops := proxyHops + meshHops
 
 	response := map[string]interface{}{
-		"headers": headers,
-		"hop_count": hopCount,
-		"remote_addr": r.RemoteAddr,
+		"headers":          headers,
+		"proxy_hop_count":  proxyHops,
+		"mesh_hop_count":   meshHops,
+		"total_hop_count":  totalHops,
+		"hop_count":        totalHops, // Deprecated: use split counters
+		"remote_addr":      r.RemoteAddr,
 	}
 
 	json.NewEncoder(w).Encode(response)
