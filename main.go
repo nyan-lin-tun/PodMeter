@@ -47,6 +47,7 @@ type Stats struct {
 	UptimeSeconds int64 `json:"uptime_seconds"`
 
 	// Network/Proxy metrics
+	CurrentHopCount  int     `json:"current_hop_count"`
 	AvgProxyHops     float64 `json:"avg_proxy_hops"`
 	ProxyDetected    bool    `json:"proxy_detected"`
 	IstioSidecar     bool    `json:"istio_sidecar_detected"`
@@ -212,6 +213,7 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 			GCPauseMs:         round(float64(memStats.PauseNs[(memStats.NumGC+255)%256]) / 1e6),
 			NumGC:             memStats.NumGC,
 			UptimeSeconds:     int64(uptime),
+			CurrentHopCount:   currentHops,
 			AvgProxyHops:      avgHops,
 			ProxyDetected:     proxyDetected,
 			IstioSidecar:      istioDetected,
@@ -289,6 +291,7 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 		UptimeSeconds: int64(uptime),
 
 		// Network/Proxy metrics
+		CurrentHopCount:  currentHops,
 		AvgProxyHops:     avgHops,
 		ProxyDetected:    proxyDetected,
 		IstioSidecar:     istioDetected,
