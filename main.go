@@ -47,15 +47,17 @@ type Stats struct {
 	UptimeSeconds int64 `json:"uptime_seconds"`
 
 	// Network/Proxy metrics
-	CurrentHopCount    int                `json:"current_hop_count"`     // Deprecated: use proxy_hop_count + service_mesh_hops
-	ProxyHopCount      int                `json:"proxy_hop_count"`       // Traditional proxy hops (nginx, X-Forwarded-For, Via)
-	ServiceMeshHops    int                `json:"service_mesh_hops"`     // Service mesh hops (Istio/Envoy headers)
-	TotalHopCount      int                `json:"total_hop_count"`       // proxy_hop_count + service_mesh_hops
-	AvgProxyHops       float64            `json:"avg_proxy_hops"`
-	ProxyDetected      bool               `json:"proxy_detected"`
-	IstioSidecar       bool               `json:"istio_sidecar_detected"`
-	RequestsViaProxy   int64              `json:"requests_via_proxy"`
-	DebugHeaders       map[string]string  `json:"debug_headers,omitempty"`
+	CurrentHopCount      int                `json:"current_hop_count"`     // Deprecated: use proxy_hop_count + service_mesh_hops
+	ProxyHopCount        int                `json:"proxy_hop_count"`       // Traditional proxy hops (nginx, X-Forwarded-For, Via)
+	ServiceMeshHops      int                `json:"service_mesh_hops"`     // Service mesh hops (Istio/Envoy headers)
+	TotalHopCount        int                `json:"total_hop_count"`       // proxy_hop_count + service_mesh_hops
+	AvgProxyHops         float64            `json:"avg_proxy_hops"`
+	ProxyDetected        bool               `json:"proxy_detected"`
+	IstioSidecar         bool               `json:"istio_sidecar_detected"`
+	WaypointProxyDetected bool              `json:"waypoint_proxy_detected"` // Ambient L7 waypoint proxy detected
+	ServiceMeshMode      string             `json:"service_mesh_mode"`      // none, ambient-l4, ambient-l7, sidecar
+	RequestsViaProxy     int64              `json:"requests_via_proxy"`
+	DebugHeaders         map[string]string  `json:"debug_headers,omitempty"`
 
 	// System information
 	Hostname         string  `json:"hostname"`
@@ -178,6 +180,36 @@ func countTotalHops(r *http.Request) int {
 	return countProxyHops(r) + countServiceMeshHops(r)
 }
 
+// detectServiceMeshMode determines the service mesh configuration based on headers and sidecar presence
+// Returns the mode (sidecar, ambient-l7, ambient-l4, or none) and whether waypoint proxy is detected
+func detectServiceMeshMode(r *http.Request, sidecarPresent bool) (mode string, waypointDetected bool) {
+	// Check for L7 service mesh headers (Envoy/Istio)
+	hasL7Headers := false
+	if r.Header.Get("X-Request-Id") != "" {
+		hasL7Headers = true
+	}
+	if r.Header.Get("X-Envoy-Decorator-Operation") != "" {
+		hasL7Headers = true
+	}
+	if r.Header.Get("X-B3-TraceId") != "" {
+		hasL7Headers = true
+	}
+
+	// Determine mode based on sidecar presence and L7 headers
+	if sidecarPresent {
+		// Envoy sidecar is running in the pod (port 15000)
+		return "sidecar", false
+	} else if hasL7Headers {
+		// No sidecar but L7 headers present = waypoint proxy (ambient L7 mode)
+		return "ambient-l7", true
+	}
+
+	// No sidecar and no L7 headers
+	// Note: ambient-l4 (ztunnel only) cannot be reliably detected from headers
+	// because ztunnel operates at L4 and doesn't add HTTP headers
+	return "none", false
+}
+
 func statsHandler(w http.ResponseWriter, r *http.Request) {
 	// Copy data under read lock to minimize critical section
 	mu.RLock()
@@ -222,6 +254,9 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 	istioHeaderSignal := hasIstioHeaders(r)
 	istioDetected := istioHeaderSignal || istioSidecarPresent()
 
+	// Detect service mesh mode (none, ambient-l4, ambient-l7, sidecar)
+	meshMode, waypointDetected := detectServiceMeshMode(r, istioSidecarPresent())
+
 	// Calculate average proxy hops
 	avgHops := 0.0
 	if len(proxyHopsCopy) > 0 {
@@ -251,16 +286,18 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 			GCPauseMs:         round(float64(memStats.PauseNs[(memStats.NumGC+255)%256]) / 1e6),
 			NumGC:             memStats.NumGC,
 			UptimeSeconds:     int64(uptime),
-			CurrentHopCount:   currentHops,
-			ProxyHopCount:     proxyHops,
-			ServiceMeshHops:   meshHops,
-			TotalHopCount:     totalHops,
-			AvgProxyHops:      avgHops,
-			ProxyDetected:     proxyDetected,
-			IstioSidecar:      istioDetected,
-			RequestsViaProxy:  totalViaProxy,
-			DebugHeaders:      debugHeaders,
-			Hostname:          hostname,
+			CurrentHopCount:       currentHops,
+			ProxyHopCount:         proxyHops,
+			ServiceMeshHops:       meshHops,
+			TotalHopCount:         totalHops,
+			AvgProxyHops:          avgHops,
+			ProxyDetected:         proxyDetected,
+			IstioSidecar:          istioDetected,
+			WaypointProxyDetected: waypointDetected,
+			ServiceMeshMode:       meshMode,
+			RequestsViaProxy:      totalViaProxy,
+			DebugHeaders:          debugHeaders,
+			Hostname:              hostname,
 			OS:                runtime.GOOS,
 			Architecture:      runtime.GOARCH,
 			NumCPU:            runtime.NumCPU(),
@@ -333,15 +370,17 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 		UptimeSeconds: int64(uptime),
 
 		// Network/Proxy metrics
-		CurrentHopCount:  currentHops,
-		ProxyHopCount:    proxyHops,
-		ServiceMeshHops:  meshHops,
-		TotalHopCount:    totalHops,
-		AvgProxyHops:     avgHops,
-		ProxyDetected:    proxyDetected,
-		IstioSidecar:     istioDetected,
-		RequestsViaProxy: totalViaProxy,
-		DebugHeaders:     debugHeaders,
+		CurrentHopCount:       currentHops,
+		ProxyHopCount:         proxyHops,
+		ServiceMeshHops:       meshHops,
+		TotalHopCount:         totalHops,
+		AvgProxyHops:          avgHops,
+		ProxyDetected:         proxyDetected,
+		IstioSidecar:          istioDetected,
+		WaypointProxyDetected: waypointDetected,
+		ServiceMeshMode:       meshMode,
+		RequestsViaProxy:      totalViaProxy,
+		DebugHeaders:          debugHeaders,
 
 		// System information
 		Hostname:          hostname,
